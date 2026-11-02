@@ -1,0 +1,123 @@
+/**
+ * 建立一個可自由指定 32-bit 數據速率的高精度 Float32Array 串流
+ * @param {Object} options 配置參數
+ * @param {number} [options.targetMBps] 目標資料速率：每秒多少兆位元組 (MB/s)
+ * @param {number} [options.targetMbps] 目標網路速率：每秒多少兆位元 (Mbps) - 自動換算為 32-bit
+ * @param {number} [options.desiredIntervalMs] 期望的每包時間間隔（毫秒，預設 2ms）
+ * @param {function} [onRateUpdate] 速率回呼函式，每秒回傳實測數據
+ */
+function createCustomRate32BitStream(options = {}, onRateUpdate = null) {
+  let worker = null;
+  let metricsTimer = null;
+
+  const BYTES_PER_FLOAT32 = 4; // 32-bit = 4 Bytes
+  let targetBytesPerSec = 0;
+
+  // 1. 依據輸入的 32-bit 速率標準計算每秒需要的總位元組數 (Bytes/sec)
+  if (options.targetMBps) {
+    // 1 MB = 1,024 * 1024 Bytes
+    targetBytesPerSec = options.targetMBps * 1024 * 1024;
+  } else if (options.targetMbps) {
+    // 1 Mbps = 1,000,000 bits. 轉成 Bytes 需除以 8
+    targetBytesPerSec = (options.targetMbps * 1000 * 1000) / 8;
+  } else {
+    throw new Error("請指定 targetMBps 或 targetMbps 參數！");
+  }
+
+  // 2. 將總位元組數除以 4 (32-bit)，得到每秒必須產生的 Float32 元素量 (Samples/sec)
+  const samplesPerSec = targetBytesPerSec / BYTES_PER_FLOAT32;
+
+  // 3. 計算在期望的時間間隔下，每一包（Chunk）應包含多少個 Float32 元素
+  const intervalMs = options.desiredIntervalMs || 2; 
+  const chunkSize = Math.round(samplesPerSec * (intervalMs / 1000));
+  
+  // 4. 反推最精準的時間間隔，消除四捨五入的微小誤差
+  const preciseIntervalMs = (chunkSize / samplesPerSec) * 1000;
+
+  console.log(`[32-bit 系統配置]`);
+  console.log(` ├─ 目標頻寬: ${(targetBytesPerSec / (1024 * 1024)).toFixed(2)} MB/s (${(targetBytesPerSec * 8 / 1000 / 1000).toFixed(2)} Mbps)`);
+  console.log(` ├─ 採樣速率: ${Math.round(samplesPerSec).toLocaleString()} samples/sec (Float32)`);
+  console.log(` └─ 自動配對: 每包大小 (chunkSize) = ${chunkSize} 元素 | 發送間隔 = ${preciseIntervalMs.toFixed(4)} ms`);
+
+  // 統計變數
+  let totalBytesReceived = 0;
+  let totalSamplesReceived = 0;
+  let lastTime = performance.now();
+
+  // 內聯 Worker 原始碼
+  const workerCode = `
+    self.onmessage = function (e) {
+      if (e.data.action === 'start') {
+        const { chunkSize, intervalMs } = e.data;
+        let nextTick = performance.now() + intervalMs;
+
+        while (true) {
+          // 微秒級自旋鎖
+          while (performance.now() < nextTick) {}
+
+          // 建立 32-bit Float32Array
+          const buffer = new Float32Array(chunkSize);
+          for (let i = 0; i < chunkSize; i++) {
+            buffer[i] = Math.random() * 2 - 1;
+          }
+
+          // 零複製記憶體轉移 (Transferable)
+          self.postMessage(buffer, [buffer.buffer]);
+          nextTick += intervalMs;
+        }
+      }
+    };
+  `;
+
+  return new ReadableStream({
+    start(controller) {
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      worker = new Worker(URL.createObjectURL(blob));
+
+      // 每秒動態速率監測
+      lastTime = performance.now();
+      metricsTimer = setInterval(() => {
+        const now = performance.now();
+        const durationSec = (now - lastTime) / 1000;
+
+        if (durationSec > 0) {
+          const bytesPerSec = totalBytesReceived / durationSec;
+          const currentSamplesPerSec = totalSamplesReceived / durationSec;
+          
+          const mbPerSec = bytesPerSec / (1024 * 1024);
+          const mbps = (bytesPerSec * 8) / (1000 * 1000); // 算回網路頻寬 Mbps
+
+          if (onRateUpdate) {
+            onRateUpdate({
+              mbPerSec: mbPerSec.toFixed(2),
+              mbps: mbps.toFixed(2),
+              samplesPerSec: Math.round(currentSamplesPerSec),
+              packetIntervalMs: (durationSec / (totalSamplesReceived / chunkSize) * 1000).toFixed(3)
+            });
+          }
+        }
+
+        totalBytesReceived = 0;
+        totalSamplesReceived = 0;
+        lastTime = now;
+      }, 1000);
+
+      worker.onmessage = (e) => {
+        const float32Array = e.data;
+        totalSamplesReceived += float32Array.length;
+        totalBytesReceived += float32Array.byteLength; // 瀏覽器底層會自動依據 32-bit (4 Bytes) 計算出精確位元組數
+        controller.enqueue(float32Array);
+      };
+
+      worker.postMessage({ action: 'start', chunkSize, intervalMs: preciseIntervalMs });
+    },
+
+    cancel() {
+      if (metricsTimer) clearInterval(metricsTimer);
+      if (worker) {
+        worker.terminate();
+        console.log("Stream Worker stopped.");
+      }
+    }
+  });
+}
